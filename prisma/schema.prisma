@@ -1,0 +1,88 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model TwapSampleRecord {
+  id            String   @id @default(cuid())
+  symbol        String
+  price         Float
+  windowSeconds Int
+  timestamp     DateTime
+  createdAt     DateTime @default(now())
+
+  @@index([symbol, timestamp])
+}
+
+model SignalRecord {
+  id              String   @id @default(cuid())
+  marketSlug      String
+  fairProbUp      Float
+  edgeAfterFees   Float
+  recommendedSide String
+  confidence      Float
+  abstain         Boolean
+  modelVersion    String
+  features        String
+  timestamp       DateTime @default(now())
+
+  @@index([marketSlug, timestamp])
+}
+
+model BacktestRun {
+  id        String   @id @default(cuid())
+  status    String
+  params    String
+  metrics   String?
+  createdAt DateTime @default(now())
+  trades    BacktestTradeRecord[]
+}
+
+model BacktestTradeRecord {
+  id            String      @id @default(cuid())
+  backtestId    String
+  backtest      BacktestRun @relation(fields: [backtestId], references: [id], onDelete: Cascade)
+  marketSlug    String
+  side          String
+  entryPrice    Float
+  exitPrice     Float
+  size          Float
+  pnl           Float
+  fees          Float
+  projectedTwap Float
+  outcome       String
+  timestamp     DateTime
+
+  @@index([backtestId])
+}
+
+model PaperSessionRecord {
+  id        String   @id @default(cuid())
+  status    String
+  startedAt DateTime @default(now())
+  stoppedAt DateTime?
+  pnl       Float    @default(0)
+  fees      Float    @default(0)
+  trades    Int      @default(0)
+}
+
+model AuditExecution {
+  id        String   @id @default(cuid())
+  mode      String
+  action    String
+  payload   String
+  timestamp DateTime @default(now())
+}
+
+model ModelVersion {
+  id        String   @id @default(cuid())
+  version   String   @unique
+  name      String
+  metrics   String?
+  promoted  Boolean  @default(false)
+  createdAt DateTime @default(now())
+}

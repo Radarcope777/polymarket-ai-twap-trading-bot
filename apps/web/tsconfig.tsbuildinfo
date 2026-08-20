@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/hooks.ts","./src/main.tsx","./src/vite-env.d.ts","./src/pages/AiSignals.tsx","./src/pages/BacktestLab.tsx","./src/pages/LiveTrading.tsx","./src/pages/Overview.tsx","./src/pages/PaperTrading.tsx","./src/pages/Settings.tsx","./src/pages/TwapMonitor.tsx"],"version":"5.9.3"}

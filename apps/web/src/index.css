@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+.card {
+  @apply bg-surface-card border border-gray-800 rounded-xl p-5;
+}
+
+.stat-value {
+  @apply text-2xl font-bold tracking-tight;
+}
+
+.badge {
+  @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+}
+
+.badge-green {
+  @apply badge bg-emerald-500/20 text-emerald-400;
+}
+
+.badge-amber {
+  @apply badge bg-amber-500/20 text-amber-400;
+}
+
+.badge-red {
+  @apply badge bg-red-500/20 text-red-400;
+}
+
+.badge-blue {
+  @apply badge bg-blue-500/20 text-blue-400;
+}

@@ -1,8 +1,14 @@
 node_modules/
 dist/
+build/
 .env
 .env.local
-*.log
-coverage/
+*.db
+*.db-journal
 .DS_Store
-.idea/
+coverage/
+.turbo/
+*.log
+apps/web/dist/
+apps/api/dist/
+packages/*/dist/

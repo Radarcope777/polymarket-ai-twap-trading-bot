@@ -1,57 +1,31 @@
-import { describe, it, expect } from 'vitest';
-import { loadConfig, SOL_MINT, USDC_MINT } from '../src/config/index.js';
-import { resolveToken, resolveTokens, toBaseUnits } from '../src/market/tokenRegistry.js';
-import { calculateProfitBps, applySlippage, bpsToRatio } from '../src/utils/math.js';
+import { describe, expect, it } from "vitest";
+import { normalizeInstrument, loadConfig } from "../src/config/index.js";
 
-describe('config', () => {
-  it('loads defaults in mock mode', () => {
-    const config = loadConfig({ BOT_MODE: 'mock' });
-    expect(config.mode).toBe('mock');
-    expect(config.dryRun).toBe(true);
-    expect(config.minProfitBps).toBeGreaterThan(0);
+describe("config", () => {
+  it("normalizes instrument names", () => {
+    expect(normalizeInstrument("btc-usdt-perp")).toBe("BTC_USDT_Perp");
+    expect(normalizeInstrument("BTC_USDT_Perp")).toBe("BTC_USDT_Perp");
+    expect(normalizeInstrument("eth usdt perpetual")).toBe("ETH_USDT_Perp");
   });
 
-  it('parses watch tokens', () => {
-    const config = loadConfig({ WATCH_TOKENS: 'SOL, USDC , BONK' });
-    expect(config.watchTokenSymbols).toEqual(['SOL', 'USDC', 'BONK']);
-  });
-});
+  it("loads dry-run config with defaults", () => {
+    process.env.DRY_RUN = "true";
+    process.env.GRVT_API_KEY = "test";
+    process.env.GRVT_TRADING_ACCOUNT_ID = "123";
 
-describe('tokenRegistry', () => {
-  it('resolves SOL by symbol and mint', () => {
-    expect(resolveToken('SOL')?.mint).toBe(SOL_MINT);
-    expect(resolveToken(SOL_MINT)?.symbol).toBe('SOL');
-  });
-
-  it('resolves multiple tokens without duplicates', () => {
-    const tokens = resolveTokens(['SOL', 'SOL', 'USDC']);
-    expect(tokens).toHaveLength(2);
-    expect(tokens.map((t) => t.symbol)).toEqual(['SOL', 'USDC']);
+    const config = loadConfig({ dryRun: true });
+    expect(config.trading.instrument).toBe("BTC_USDT_Perp");
+    expect(config.trading.dryRun).toBe(true);
+    expect(config.trading.emaFast).toBeLessThan(config.trading.emaSlow);
   });
 
-  it('converts base units', () => {
-    expect(toBaseUnits(1, 9)).toBe(1_000_000_000n);
-    expect(toBaseUnits(1, 6)).toBe(1_000_000n);
-  });
-});
+  it("rejects invalid ema configuration", () => {
+    process.env.DRY_RUN = "true";
+    process.env.GRVT_API_KEY = "test";
+    process.env.GRVT_TRADING_ACCOUNT_ID = "123";
+    process.env.EMA_FAST = "30";
+    process.env.EMA_SLOW = "10";
 
-describe('math utils', () => {
-  it('calculates profit bps', () => {
-    expect(calculateProfitBps(1_000_000n, 1_001_500n)).toBe(15);
-  });
-
-  it('applies slippage', () => {
-    expect(applySlippage(10_000n, 100)).toBe(9_900n);
-  });
-
-  it('converts bps to ratio', () => {
-    expect(bpsToRatio(50)).toBe(0.005);
-  });
-});
-
-describe('constants', () => {
-  it('has valid mint addresses', () => {
-    expect(USDC_MINT.length).toBeGreaterThan(30);
-    expect(SOL_MINT.length).toBeGreaterThan(30);
+    expect(() => loadConfig({ dryRun: true })).toThrow(/emaFast must be less than emaSlow/);
   });
 });

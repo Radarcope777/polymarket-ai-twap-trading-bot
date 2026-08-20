@@ -1,206 +1,234 @@
-import type { AppConfig } from '../config/index.js';
-import type {
-  ArbitrageOpportunity,
-  BotStats,
-  RejectedOpportunity,
-  ScanResult,
-  StrategyContext,
-} from '../types/index.js';
-import type { ExchangeClient } from '../exchanges/types.js';
-import type { ArbitrageStrategy } from '../strategies/base.js';
-import { PriceFeed } from '../market/priceFeed.js';
-import { resolveTokens } from '../market/tokenRegistry.js';
-import { RiskManager, CircuitBreaker } from '../risk/manager.js';
-import { TradeExecutor } from '../execution/executor.js';
-import { logger } from '../utils/logger.js';
+import type { AppConfig } from "../config/index.js";
+import { GrvtClient } from "../api/grvt/client.js";
+import { GrvtWebSocket } from "../api/grvt/websocket.js";
+import { FeatureEngine, SignalScorer } from "../ai/feature-engine.js";
+import { ExecutionEngine } from "./execution.js";
+import { MarketDataService } from "../services/market-data.js";
+import { createLogger, type Logger } from "../services/logger.js";
+import { RiskManager } from "../services/risk-manager.js";
+import { createStrategy } from "../strategies/index.js";
+import { positionSideFromSize, type TradingStrategy } from "../strategies/base.js";
 
-export class ArbitrageEngine {
-  private stats: BotStats = {
-    totalScans: 0,
-    opportunitiesFound: 0,
-    tradesExecuted: 0,
-    tradesSucceeded: 0,
-    totalProfitLamports: 0n,
-    consecutiveFailures: 0,
-    circuitBreakerOpen: false,
-  };
+export class TradingEngine {
+  private readonly client: GrvtClient;
+  private readonly ws: GrvtWebSocket;
+  private readonly marketData: MarketDataService;
+  private readonly risk: RiskManager;
+  private readonly execution: ExecutionEngine;
+  private readonly strategy;
+  private readonly featureEngine = new FeatureEngine();
+  private readonly signalScorer = new SignalScorer();
+  private readonly logger: Logger;
+  private tickTimer: ReturnType<typeof setInterval> | null = null;
+  private running = false;
+  private tickCount = 0;
 
-  private scanning = false;
-  private intervalId: ReturnType<typeof setInterval> | null = null;
-
-  constructor(
-    private readonly config: AppConfig,
-    private readonly strategies: ArbitrageStrategy[],
-    private readonly clients: ExchangeClient[],
-    private readonly priceFeed: PriceFeed,
-    private readonly riskManager: RiskManager,
-    private readonly circuitBreaker: CircuitBreaker,
-    private readonly executor: TradeExecutor,
-  ) {}
-
-  getStats(): BotStats {
-    return {
-      ...this.stats,
-      consecutiveFailures: this.circuitBreaker.getConsecutiveFailures(),
-      circuitBreakerOpen: this.circuitBreaker.isOpen(),
-    };
-  }
-
-  async scanOnce(): Promise<ScanResult> {
-    const start = Date.now();
-    this.stats.totalScans += 1;
-
-    if (this.config.mode === 'mock') {
-      this.priceFeed.tickMockVolatility();
-    } else {
-      await this.priceFeed.refreshLive();
-    }
-
-    const context = this.buildContext();
-    const rawOpportunities: ArbitrageOpportunity[] = [];
-    const rejected: RejectedOpportunity[] = [];
-
-    for (const strategy of this.strategies) {
-      try {
-        const found = await strategy.scan(context, this.clients);
-        rawOpportunities.push(...found);
-        logger.debug(`Strategy ${strategy.name} found ${found.length} opportunities`);
-      } catch (error) {
-        logger.warn(`Strategy ${strategy.name} failed`, {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-
-    const deduped = this.deduplicateOpportunities(rawOpportunities);
-    const approved: ArbitrageOpportunity[] = [];
-
-    for (const opp of deduped) {
-      const rejection = this.riskManager.validate(opp);
-      if (rejection) {
-        rejected.push(rejection);
-      } else {
-        approved.push(opp);
-      }
-    }
-
-    this.stats.opportunitiesFound += approved.length;
-    this.stats.lastScanAt = Date.now();
-
-    const result: ScanResult = {
-      scannedAt: Date.now(),
-      mode: this.config.mode,
-      opportunities: approved,
-      rejected,
-      durationMs: Date.now() - start,
-    };
-
-    if (approved.length > 0) {
-      logger.info(`Scan complete: ${approved.length} opportunities`, {
-        bestBps: approved[0]?.netProfitBps,
-        durationMs: result.durationMs,
-      });
-    }
-
-    return result;
-  }
-
-  async executeBest(opportunities: ArbitrageOpportunity[]): Promise<void> {
-    if (this.circuitBreaker.isOpen()) {
-      logger.warn('Circuit breaker open — skipping execution');
-      return;
-    }
-
-    const best = opportunities[0];
-    if (!best) return;
-
-    this.stats.tradesExecuted += 1;
-    this.riskManager.recordTrade();
-
-    const result = await this.executor.execute(best);
-
-    if (result.success) {
-      this.circuitBreaker.recordSuccess();
-      this.stats.tradesSucceeded += 1;
-      if (result.profitLamports) {
-        this.stats.totalProfitLamports += result.profitLamports;
-      }
-    } else {
-      this.circuitBreaker.recordFailure();
-    }
-  }
-
-  startContinuous(onScan: (result: ScanResult) => void | Promise<void>): void {
-    if (this.scanning) return;
-    this.scanning = true;
-
-    const run = async () => {
-      try {
-        const result = await this.scanOnce();
-        await onScan(result);
-        if (result.opportunities.length > 0 && this.config.executionEnabled) {
-          await this.executeBest(result.opportunities);
-        }
-      } catch (error) {
-        logger.error('Scan loop error', {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    };
-
-    void run();
-    this.intervalId = setInterval(() => void run(), this.config.scanIntervalMs);
-    logger.info('Continuous scanning started', { intervalMs: this.config.scanIntervalMs });
-  }
-
-  stop(): void {
-    if (this.intervalId) {
-      clearInterval(this.intervalId);
-      this.intervalId = null;
-    }
-    this.scanning = false;
-    logger.info('Scanner stopped');
-  }
-
-  private buildContext(): StrategyContext {
-    return {
-      tokens: resolveTokens(this.config.watchTokenSymbols),
-      minProfitBps: this.config.minProfitBps,
-      maxSlippageBps: this.config.maxSlippageBps,
-      maxTradeSizeLamports: this.config.maxTradeSizeLamports,
-    };
-  }
-
-  private deduplicateOpportunities(opportunities: ArbitrageOpportunity[]): ArbitrageOpportunity[] {
-    const seen = new Set<string>();
-    const sorted = [...opportunities].sort((a, b) => b.netProfitBps - a.netProfitBps);
-
-    return sorted.filter((opp) => {
-      const key = `${opp.strategy}:${opp.legs.map((l) => `${l.venue}:${l.inputMint}:${l.outputMint}`).join('|')}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
+  constructor(private readonly config: AppConfig) {
+    this.logger = createLogger(config.logLevel);
+    this.client = new GrvtClient({
+      endpoints: config.grvt.endpoints,
+      apiKey: config.grvt.apiKey,
+      tradingAccountId: config.grvt.tradingAccountId,
+      privateKey: config.grvt.privateKey,
     });
+    this.ws = new GrvtWebSocket({
+      wsUrl: config.grvt.endpoints.wsMarketUrl,
+      instrument: config.trading.instrument,
+    });
+    this.marketData = new MarketDataService(this.client, config.trading.instrument);
+    this.risk = new RiskManager({
+      maxPositionSize: config.trading.maxPositionSize,
+      maxDailyLossUsd: config.trading.maxDailyLossUsd,
+      orderSize: config.trading.orderSize,
+      stopLossBps: config.trading.stopLossBps,
+      takeProfitBps: config.trading.takeProfitBps,
+    });
+    this.execution = new ExecutionEngine(
+      this.client,
+      config.trading.instrument,
+      config.trading.dryRun,
+      this.risk,
+      this.logger,
+    );
+    this.strategy = createStrategy(config.trading.strategy);
   }
-}
 
-export function createEngine(
-  config: AppConfig,
-  strategies: ArbitrageStrategy[],
-  clients: ExchangeClient[],
-): ArbitrageEngine {
-  const priceFeed = new PriceFeed(config.mode);
-  const riskManager = new RiskManager(config);
-  const circuitBreaker = new CircuitBreaker(config.maxConsecutiveFailures);
-  const executor = new TradeExecutor(config);
+  async start(): Promise<void> {
+    if (this.running) return;
+    this.running = true;
 
-  return new ArbitrageEngine(
-    config,
-    strategies,
-    clients,
-    priceFeed,
-    riskManager,
-    circuitBreaker,
-    executor,
-  );
+    this.logger.info(
+      {
+        instrument: this.config.trading.instrument,
+        strategy: this.config.trading.strategy,
+        dryRun: this.config.trading.dryRun,
+        env: this.config.grvt.env,
+      },
+      "Starting GRVT AI trading engine",
+    );
+
+    await this.marketData.bootstrap();
+
+    if (!this.config.trading.dryRun) {
+      const position = await this.client.getPosition(this.config.trading.instrument);
+      if (position) {
+        this.risk.setPosition(position.size, position.avgEntryPrice);
+      }
+    }
+
+    this.ws.onOrderBook((book) => this.marketData.applyOrderBook(book));
+    this.ws.onInstrument((data) => this.marketData.updateInstrument(data));
+    this.ws.connect();
+
+    this.tickTimer = setInterval(() => {
+      void this.tick();
+    }, this.config.trading.tickIntervalMs);
+
+    await this.tick();
+  }
+
+  async stop(): Promise<void> {
+    this.running = false;
+    if (this.tickTimer) {
+      clearInterval(this.tickTimer);
+      this.tickTimer = null;
+    }
+    this.ws.disconnect();
+    this.logger.info("Trading engine stopped");
+  }
+
+  async tick(): Promise<void> {
+    if (!this.running) return;
+
+    try {
+      if (this.tickCount % 10 === 0) {
+        await this.marketData.refreshCandles();
+      }
+      this.tickCount++;
+
+      const candles = this.marketData.getCandles();
+      const closes = this.marketData.getCloses();
+      const lastPrice = this.marketData.getLastPrice();
+      const positionSize = this.risk.getPositionSize();
+
+      const strategyConfig = {
+        orderSize: this.config.trading.orderSize,
+        rsiPeriod: this.config.trading.rsiPeriod,
+        rsiOversold: this.config.trading.rsiOversold,
+        rsiOverbought: this.config.trading.rsiOverbought,
+        emaFast: this.config.trading.emaFast,
+        emaSlow: this.config.trading.emaSlow,
+        bollingerPeriod: this.config.trading.bollingerPeriod,
+        bollingerStdDev: this.config.trading.bollingerStdDev,
+        momentumWindow: this.config.trading.momentumWindow,
+        fundingThresholdBps: this.config.trading.fundingThresholdBps,
+      };
+
+      const ctx = {
+        candles,
+        closes,
+        lastPrice,
+        markPrice: this.marketData.getMarkPrice(),
+        fundingRate: this.marketData.getFundingRate(),
+        book: this.marketData.book,
+        positionSize,
+        positionSide: positionSideFromSize(positionSize),
+      };
+
+      const signal = this.strategy.evaluate(ctx, strategyConfig);
+
+      const features = this.featureEngine.extract(
+        candles,
+        this.marketData.book.getSnapshot(this.config.trading.instrument),
+        this.marketData.getFundingRate(),
+        strategyConfig,
+      );
+      const aiScore = this.signalScorer.score(features);
+
+      this.logger.debug(
+        {
+          signal: signal.side,
+          confidence: signal.confidence.toFixed(2),
+          reason: signal.reason,
+          aiBuy: aiScore.buyScore.toFixed(2),
+          aiSell: aiScore.sellScore.toFixed(2),
+          price: lastPrice,
+        },
+        "Tick evaluation",
+      );
+
+      const trigger = this.risk.checkPriceTriggers(lastPrice);
+      if (trigger === "stop_loss" || trigger === "take_profit") {
+        const closeSide = positionSize > 0 ? "Sell" : "Buy";
+        await this.execution.closePosition(Math.abs(positionSize), closeSide);
+        return;
+      }
+
+      if (signal.side && signal.confidence >= 0.25) {
+        await this.execution.executeSignal(
+          signal,
+          lastPrice,
+          this.config.trading.orderSize,
+        );
+      }
+    } catch (error) {
+      this.logger.error({ error }, "Tick error");
+    }
+  }
+
+  async simulate(): Promise<{
+    signal: ReturnType<TradingStrategy["evaluate"]>;
+    features: ReturnType<FeatureEngine["extract"]>;
+    aiScore: ReturnType<SignalScorer["score"]>;
+    lastPrice: number;
+  }> {
+    await this.marketData.bootstrap();
+
+    const candles = this.marketData.getCandles();
+    const closes = this.marketData.getCloses();
+    const lastPrice = this.marketData.getLastPrice();
+
+    const strategyConfig = {
+      orderSize: this.config.trading.orderSize,
+      rsiPeriod: this.config.trading.rsiPeriod,
+      rsiOversold: this.config.trading.rsiOversold,
+      rsiOverbought: this.config.trading.rsiOverbought,
+      emaFast: this.config.trading.emaFast,
+      emaSlow: this.config.trading.emaSlow,
+      bollingerPeriod: this.config.trading.bollingerPeriod,
+      bollingerStdDev: this.config.trading.bollingerStdDev,
+      momentumWindow: this.config.trading.momentumWindow,
+      fundingThresholdBps: this.config.trading.fundingThresholdBps,
+    };
+
+    const ctx = {
+      candles,
+      closes,
+      lastPrice,
+      markPrice: this.marketData.getMarkPrice(),
+      fundingRate: this.marketData.getFundingRate(),
+      book: this.marketData.book,
+      positionSize: 0,
+      positionSide: positionSideFromSize(0),
+    };
+
+    const signal = this.strategy.evaluate(ctx, strategyConfig);
+    const features = this.featureEngine.extract(
+      candles,
+      this.marketData.book.getSnapshot(this.config.trading.instrument),
+      this.marketData.getFundingRate(),
+      strategyConfig,
+    );
+    const aiScore = this.signalScorer.score(features);
+
+    return { signal, features, aiScore, lastPrice };
+  }
+
+  getMarketData(): MarketDataService {
+    return this.marketData;
+  }
+
+  getClient(): GrvtClient {
+    return this.client;
+  }
 }

@@ -1,93 +1,97 @@
-import { describe, it, expect } from 'vitest';
-import { MockJupiterClient } from '../src/exchanges/jupiter/client.js';
-import { MockAxiomClient } from '../src/exchanges/axiom/client.js';
-import { MockDexClient } from '../src/exchanges/mock/dexClients.js';
-import { PriceFeed } from '../src/market/priceFeed.js';
-import { CrossDexStrategy } from '../src/strategies/crossDex.js';
-import { TriangularStrategy } from '../src/strategies/triangular.js';
-import { CexDexStrategy } from '../src/strategies/cexDex.js';
-import { resolveTokens } from '../src/market/tokenRegistry.js';
-import { solToLamports } from '../src/utils/math.js';
+import { describe, expect, it } from "vitest";
+import { OrderBookStore } from "../src/core/order-book.js";
+import { MeanReversionStrategy } from "../src/strategies/mean-reversion.js";
+import { FundingArbitrageStrategy } from "../src/strategies/funding-arbitrage.js";
+import { mergeSignals } from "../src/strategies/base.js";
+import type { Candle } from "../src/api/grvt/types.js";
 
-describe('exchange clients', () => {
-  it('mock jupiter returns quotes', async () => {
-    const feed = new PriceFeed('mock');
-    const client = new MockJupiterClient(feed, 1.01);
-    const quote = await client.getQuote({
-      inputMint: 'So11111111111111111111111111111111111111112',
-      outputMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
-      amount: 1_000_000_000n,
-      slippageBps: 50,
-    });
-    expect(quote.outputAmount).toBeGreaterThan(0n);
-    expect(quote.venue).toBe('jupiter');
+function buildCandles(count: number, base = 100): Candle[] {
+  return Array.from({ length: count }, (_, i) => ({
+    timestamp: Date.now() - (count - i) * 60_000,
+    open: base + i * 0.1,
+    high: base + i * 0.1 + 1,
+    low: base + i * 0.1 - 1,
+    close: base + i * 0.1,
+    volume: 10,
+  }));
+}
+
+describe("strategies", () => {
+  const book = new OrderBookStore(10);
+  book.applySnapshot({
+    symbol: "BTC_USDT_Perp",
+    bids: [{ price: 99, size: 5 }],
+    asks: [{ price: 101, size: 5 }],
+    timestamp: Date.now(),
   });
 
-  it('mock axiom returns quotes', async () => {
-    const feed = new PriceFeed('mock');
-    const client = new MockAxiomClient(feed, 1.005);
-    const quote = await client.getQuote({
-      inputMint: 'So11111111111111111111111111111111111111112',
-      outputMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
-      amount: 500_000_000n,
-      slippageBps: 50,
-    });
-    expect(quote.venue).toBe('axiom');
-    expect(await client.isAvailable()).toBe(true);
-  });
-
-  it('mock dex clients use price feed', async () => {
-    const feed = new PriceFeed('mock');
-    const raydium = new MockDexClient('raydium', feed);
-    const quote = await raydium.getQuote({
-      inputMint: 'So11111111111111111111111111111111111111112',
-      outputMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
-      amount: 1_000_000_000n,
-      slippageBps: 50,
-    });
-    expect(quote.outputAmount).toBeGreaterThan(0n);
-    expect(quote.venue).toBe('raydium');
-  });
-});
-
-describe('strategies', () => {
-  const context = {
-    tokens: resolveTokens(['SOL', 'USDC', 'BONK', 'WIF']),
-    minProfitBps: 5,
-    maxSlippageBps: 50,
-    maxTradeSizeLamports: solToLamports(0.5),
+  const config = {
+    orderSize: 0.001,
+    rsiPeriod: 14,
+    rsiOversold: 30,
+    rsiOverbought: 70,
+    emaFast: 9,
+    emaSlow: 21,
+    bollingerPeriod: 20,
+    bollingerStdDev: 2,
+    momentumWindow: 20,
+    fundingThresholdBps: 5,
   };
 
-  const buildClients = () => {
-    const feed = new PriceFeed('mock');
-    return [
-      new MockJupiterClient(feed, 1.002),
-      new MockAxiomClient(feed, 1.004),
-      new MockDexClient('raydium', feed),
-      new MockDexClient('orca', feed),
-      new MockDexClient('meteora', feed),
-    ];
-  };
+  it("returns neutral when data is insufficient", () => {
+    const strategy = new MeanReversionStrategy();
+    const candles = buildCandles(5);
+    const closes = candles.map((c) => c.close);
 
-  it('cross-dex finds opportunities in mock mode', async () => {
-    const strategy = new CrossDexStrategy();
-    const opps = await strategy.scan(context, buildClients());
-    expect(opps.length).toBeGreaterThan(0);
-    expect(opps[0]?.strategy).toBe('cross-dex');
-    expect(opps[0]?.netProfitBps).toBeLessThan(500);
+    const signal = strategy.evaluate(
+      {
+        candles,
+        closes,
+        lastPrice: closes[closes.length - 1]!,
+        markPrice: 100,
+        fundingRate: 0,
+        book,
+        positionSize: 0,
+        positionSide: "flat",
+      },
+      config,
+    );
+
+    expect(signal.side).toBeNull();
   });
 
-  it('triangular finds cyclic opportunities', async () => {
-    const strategy = new TriangularStrategy();
-    const opps = await strategy.scan(context, buildClients());
-    expect(opps.length).toBeGreaterThan(0);
-    expect(opps[0]?.legs.length).toBeGreaterThanOrEqual(3);
+  it("detects positive funding arbitrage short", () => {
+    const strategy = new FundingArbitrageStrategy();
+    const candles = buildCandles(30);
+
+    const signal = strategy.evaluate(
+      {
+        candles,
+        closes: candles.map((c) => c.close),
+        lastPrice: 100,
+        markPrice: 100,
+        fundingRate: 0.001,
+        book,
+        positionSize: 0,
+        positionSide: "flat",
+      },
+      config,
+    );
+
+    expect(signal.side).toBe("Sell");
+    expect(signal.confidence).toBeGreaterThan(0);
   });
 
-  it('cex-dex finds spread opportunities', async () => {
-    const strategy = new CexDexStrategy();
-    const opps = await strategy.scan(context, buildClients());
-    expect(opps.length).toBeGreaterThan(0);
-    expect(opps[0]?.strategy).toBe('cex-dex');
+  it("merges signals with weights", () => {
+    const merged = mergeSignals(
+      [
+        { side: "Buy", confidence: 0.8, reason: "a" },
+        { side: "Sell", confidence: 0.2, reason: "b" },
+      ],
+      [1, 1],
+    );
+
+    expect(merged.side).toBe("Buy");
+    expect(merged.confidence).toBeGreaterThan(0);
   });
 });

@@ -1,0 +1,22 @@
+{
+  "name": "@polymarket-twap/bot",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@polymarket-twap/polymarket-client": "workspace:*",
+    "@polymarket-twap/shared": "workspace:*",
+    "@polymarket-twap/strategy": "workspace:*",
+    "@polymarket-twap/twap-engine": "workspace:*",
+    "pino": "^9.4.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
